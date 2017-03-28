@@ -4,24 +4,24 @@
 #
 # NAME
 # 
-#        dtrsm-performance.py - runs performance tests on the dtrsm example
+#        dpotrf-performance.py - runs performance tests on the dpotrf example
 #
 # SYNOPSIS
 # 
-#        dtrsm-performance.py config.json
+#        dpotrf-performance.py config.json
 #
 # DESCRIPTION
 # 
-#        Runs performance tests on the dtrsm example. 
+#        Runs performance tests on the dpotrf example. 
 #
 #        The parameters for the sweep are specified in an external
 #        json configuration file (see CONFIGURATION below for
 #        details). There is a sample configuration file in the
-#        data/dtrsm/ directory of this repository. Modify at least the
-#        range for p to match the machine you are using.
+#        data/dpotrf/ directory of this repository. Modify at least
+#        the range for p to match the machine you are using.
 #
-#        The sweep uses a fixed value for m and uniformly spaced
-#        ranges for each of n, b, p, and q.
+#        The sweep uses uniformly spaced ranges for each of n, b, p,
+#        and q.
 #
 # CONFIGURATION
 #
@@ -33,11 +33,9 @@
 #        add or remove any keys but change the values as you like.
 #
 #        {
-#            "n_min" : 2000,
-#            "n_max" : 10000,
-#            "n_step" : 2000,
-#            
-#            "m" : 500,
+#            "n_min" : 1000,
+#            "n_max" : 6000,
+#            "n_step" : 1000,
 #            
 #            "b_min" : 50,
 #            "b_max" : 500,
@@ -67,15 +65,15 @@
 #        For example, the first few lines might look like this:
 #
 #           n     b  p  q       time  crit-path  long-path
-#        2000    50  1  0   0.443686   0.000000   0.030745
-#        2000    60  1  0   0.399642   0.000000   0.033628
-#        2000    70  1  0   0.370792   0.000000   0.036609
-#        2000    80  1  0   0.345214   0.000000   0.039327
-#        2000    90  1  0   0.333004   0.000000   0.042482
+#        1000    50  1  0   0.056440   0.000000   0.001653
+#        1000    60  1  0   0.051537   0.000000   0.002055
+#        1000    70  1  0   0.049782   0.000000   0.002453
+#        1000    80  1  0   0.047021   0.000000   0.002974
+#        1000    90  1  0   0.046890   0.000000   0.003597
 #
 # NOTE
 #
-#        Must be run from the directory containing the "test-dtrsm.x"
+#        Must be run from the directory containing the "test-dpotrf.x"
 #        executable.
 #
 ################################################################################
@@ -84,16 +82,16 @@ import subprocess
 import sys
 import json
 
-# Runs ./test-dtrsm.x with specified inputs.
+# Runs ./test-dpotrf.x with specified inputs.
 #
 # The test is repeated a few times and the result from the fastest
 # execution is returned.
 #
 # Returns a tuple (a, b, c) where a = time, b = critical path length,
 # and c = longest path length.
-def run_test(matrix_size, nrhs, block_size, num_workers, reserved_set_size):
-    reps = 5
-    cmd = './test-dtrsm.x {0} {1} {2} {3} {4} 0'.format(matrix_size, nrhs, block_size, num_workers, reserved_set_size)
+def run_test(matrix_size, block_size, num_workers, reserved_set_size):
+    reps = 3
+    cmd = './test-dpotrf.x {0} {1} {2} {3} 0'.format(matrix_size, block_size, num_workers, reserved_set_size)
     for rep in range(reps):
         process = subprocess.run(args=cmd, shell=True, stdout=subprocess.PIPE, universal_newlines=True)
         out = process.stdout
@@ -124,7 +122,6 @@ with open(sys.argv[1]) as file:
 
 # Generate lists of parameters based on configuration.
 matrix_size_list       = list(range(config['n_min'], config['n_max'] + 1, config['n_step']))
-nrhs                   = config['m']
 num_workers_list       = list(range(config['p_min'], config['p_max'] + 1, config['p_step']))
 reserved_set_size_list = list(range(config['q_min'], config['q_max'] + 1))
 block_size_list        = list(range(config['b_min'], config['b_max'] + 1, config['b_step']))
@@ -143,7 +140,7 @@ for matrix_size in matrix_size_list:
             if reserved_set_size >= num_workers:
                 continue
             for block_size in block_size_list:
-                result = run_test(matrix_size, nrhs, block_size, num_workers, reserved_set_size)
+                result = run_test(matrix_size, block_size, num_workers, reserved_set_size)
                 print('{0:5d} {1:5d} {2:2d} {3:2d} {4:10.6f} {5:10.6f} {6:10.6f}'.format(matrix_size, block_size, num_workers, reserved_set_size, result[0], result[1], result[2]))
                 sys.stdout.flush()
                 
