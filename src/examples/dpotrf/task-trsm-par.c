@@ -1,7 +1,7 @@
-#include <stdlib.h>
 #include <cblas.h>
 
 #include "tasks.h"
+#include "utils.h"
 
 
 void trsm_task_par_reconfigure(int nth)
@@ -22,18 +22,18 @@ void trsm_task_par(void *ptr, int nth, int me)
 
     int n       = arg->n;
     int m       = arg->m;
-    double *A21 = arg->A21; // m x n matrix
-    double *A11 = arg->A11; // n x n matrix
+    double *A21 = arg->A21; 
+    double *A11 = arg->A11; 
     int ldA     = arg->ldA;
 
     // Compute nominal block size.
-    int blksz = (m + nth - 1) / nth;
+    int blksz = iceil(m, nth);
 
     // Determine my share of the rows of A21.
-    const int my_first_row = blksz * me;
-    const int my_num_rows = min(blksz, m - my_first_row);
+    int my_first_row = blksz * me;
+    int my_num_rows  = min(blksz, m - my_first_row);
 
-    // Solve A21 = A21 * A11^-T.
+    // Compute A21 := A21 * inv(A11'), using my block of A21.
     if (my_num_rows > 0) {
         cblas_dtrsm(CblasColMajor, CblasRight, CblasLower, CblasTrans, CblasNonUnit,
                     my_num_rows, n,

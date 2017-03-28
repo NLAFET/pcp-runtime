@@ -8,7 +8,7 @@
 #include "spin-barrier.h"
 
 
-
+// Execution modes.
 #define PCP_REGULAR 0
 #define PCP_FIXED 1
 #define PCP_ADAPTIVE 2
@@ -16,7 +16,7 @@
 
 
 /**
- * Describes the implementations of a task type.
+ * Encapsulates the implementations of tasks of a certain type.
  *
  * @see pcp_register_task_type
  * @see pcp_insert_task
@@ -71,6 +71,9 @@ typedef int pcp_task_type_handle_t;
 typedef int pcp_task_handle_t;
 
 
+/**
+ * Represents a NULL task handle.
+ */
 static const pcp_task_handle_t PCP_TASK_HANDLE_NULL = -1;
 
 
@@ -106,7 +109,7 @@ struct pcp_event
 
 
 /**
- * Represents a change in the number of critical workers.
+ * Represents a change in the size of the reserved set.
  *
  * @see pcp_trace
  * @see pcp_view_trace
@@ -116,8 +119,8 @@ struct pcp_adaption_event
     /** When the event occurred. */
     double time;
 
-    /** The new critical worker count. */
-    int count;
+    /** The new size. */
+    int size;
 };
 
 
@@ -153,29 +156,26 @@ struct pcp_statistics
     /** The execution time in seconds. */
     double execution_time;
 
-    /** The cumulated time spent on processing tasks in seconds. */
-    double busy_time;
-
     /** The parallel cost in CPU seconds. */
     double cost;
 
-    /** The part of the cost that is spent by critical workers. */
-    double critical_worker_cost;
+    /** The part of the cost that is spent by reserved threads. */
+    double cost_reserved;
 
-    /** The part of the cost that is spent by non-critical workers. */
-    double noncritical_worker_cost;
+    /** The part of the cost that is spent by other threads. */
+    double cost_other;
+
+    /** The part of the cost that is attributed to critical tasks. */
+    double cost_critical;
+
+    /** The part of the cost that is attributed to non-critical tasks. */
+    double cost_noncritical;
 
     /** The sum of the critical task execution times. */
     double critical_path_length;
 
-    /** The execution time of the longest path. */
+    /** The total execution time of the longest path. */
     double longest_path_length;
-
-    /** The part of the cost that is attributed to critical tasks. */
-    double critical_task_cost;
-
-    /** The part of the cost that is attributed to non-critical tasks. */
-    double noncritical_task_cost;
 };
 
 
@@ -201,13 +201,21 @@ double pcp_get_time(void);
 void pcp_start(int num_workers);
 
 
-// TODO Add documentation.
+/**
+ * Changes the execution mode.
+ *
+ * @param [in] mode The desired mode. One of PCP_REGULAR, PCP_FIXED,
+ * PCP_PRESCRIBED, and PCP_ADAPTIVE.
+ */
 void pcp_set_mode(int mode);
 
 
-// TODO Add documentation.
-// TODO Rename to pcp_set_reserved_set_size
-void pcp_set_num_critical_workers(int num_critical_workers);
+/**
+ * Sets the size of the reserved set in the PCP_FIXED mode.
+ *
+ * @param [in] size The desired size.
+ */
+void pcp_set_reserved_set_size(int size);
 
 
 /**

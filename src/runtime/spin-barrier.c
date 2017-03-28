@@ -4,7 +4,7 @@
 #include "spin-barrier.h"
 
 
-struct spin_barrier
+struct pcp_barrier
 {
     int count;
     volatile int arrived;
@@ -12,9 +12,9 @@ struct spin_barrier
 };
 
 
-spin_barrier_t *spin_barrier_create(int nth)
+pcp_barrier_t *pcp_barrier_create(int nth)
 {
-    spin_barrier_t *bar = (spin_barrier_t*) malloc(sizeof(spin_barrier_t));
+    pcp_barrier_t *bar = (pcp_barrier_t*) malloc(sizeof(pcp_barrier_t));
     bar->count = nth;
     bar->arrived = 0;
     bar->generation = 0;
@@ -22,13 +22,13 @@ spin_barrier_t *spin_barrier_create(int nth)
 }
 
 
-void spin_barrier_destroy(spin_barrier_t *bar)
+void pcp_barrier_destroy(pcp_barrier_t *bar)
 {
     free(bar);
 }
 
 
-void spin_barrier_wait(spin_barrier_t *bar)
+void pcp_barrier_wait(pcp_barrier_t *bar)
 {
     const int generation = bar->generation;
     if (__sync_add_and_fetch(&bar->arrived, 1) == bar->count) {
@@ -41,9 +41,9 @@ void spin_barrier_wait(spin_barrier_t *bar)
 }
 
 
-void spin_barrier_wait_and_destroy(spin_barrier_t *bar)
+void pcp_barrier_wait_and_destroy(pcp_barrier_t *bar)
 {
     if (__sync_add_and_fetch(&bar->arrived, 1) == bar->count) {
-        spin_barrier_destroy(bar);
+        pcp_barrier_destroy(bar);
     }
 }

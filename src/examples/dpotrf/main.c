@@ -13,190 +13,137 @@
 #include "driver.h"
 #include "../../runtime/pcp.h"
 
-// TODO Remove.
-#define BLKSZ 480
 
-// TODO Remove.
-#define blocksize 16
-
-// Types of spd matrices.
-typedef enum { DENSE, BANDED, ARROWHEAD } spd_matrix_type; 
-
-// Align data structures to 32-byte memory addresses.
-#define ALIGNMENT 32
-
-
-static double gettime(void)
+static double compare_lower_triangular_matrices(int n, double *L1, int ldL1, double *L2, int ldL2)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return tv.tv_sec + 1e-6 * tv.tv_usec;
+#define L1(i,j) L1[(i) + (j) * ldL1]
+#define L2(i,j) L2[(i) + (j) * ldL2]
+
+    // Clear out the upper triangular part.
+    for (int j = 0; j < n; ++j) {
+        for (int i = 0; i < j; i++) {
+            L1(i,j) = 0.0;
+            L2(i,j) = 0.0;
+        }
+    }
+
+    // Compute L1 := L1 - L2.
+    for (int j = 0; j < n; j++) {
+        for (int i = 0; i < n; i++) {
+            L1(i,j) = L1(i,j) - L2(i,j);
+        }
+    }
+             
+    // Compute || L1 ||_F.
+    double error = LAPACKE_dlange(LAPACK_COL_MAJOR, 'F', n, n, L1, ldL1);
+    error /= n;
+    return error;
+
+#undef L1
+#undef L2
 }
 
 
-static void compare_lower_triangular_matrices(int n, double *L1, double *L2);
-
+static void usage(char *prog)
+{
+    printf("Usage: %s n b p q\n", prog);
+    printf("\n");
+    printf("n: The size of the matrix\n");
+    printf("b: The tile size\n");
+    printf("p: The number of threads (or 0 for one per core)\n");
+    printf("q: The size of the reserved set (or 0 to use the regular mode)\n");
+    exit(EXIT_FAILURE);
+}
+    
 
 int main(int argc, char** argv)
 {
-    int verify = 1;
-    
+    // Verify the number of command line options.
     if (argc != 5 && argc != 6) {
-        printf("Usage: %s matrix-size blksz num-workers num-critical-workers\n", argv[0]);
-        printf("\n");
-        printf("matrix-size:          The size of the triangular matrix\n");
-        printf("blksz:                The tile size\n");
-        printf("num-workers:          The number of workers (threads) or 0 for one thread per core\n");
-        printf("num-critical-workers: The fixed number of critical workers or -1 for adaptive or -2 for prescribed\n");
-        return EXIT_FAILURE;
+        usage(argv[0]);
     }
 
+    // Parse command line.
+    int n = atoi(argv[1]);
+    int blksz = atoi(argv[2]);
+    int num_threads = atoi(argv[3]);
+    int reserved_set_size = atoi(argv[4]);
+    int verify = 1;
     if (argc == 6) {
         verify = 0;
+    }
+
+    // Verify options.
+    if (n < 1 ||
+        blksz < 1 ||
+        num_threads < 0 ||
+        reserved_set_size < 0 ||
+        (reserved_set_size >= num_threads && num_threads > 0)) {
+        usage(argv[0]);
     }
     
     // Initialise random number generator.
     srand(time(NULL));
 
-    // Parse input parameters.
-    int n = atoi(argv[1]);
-    int blksz = atoi(argv[2]);
-    int num_workers = atoi(argv[3]);
-    int num_critical_workers = atoi(argv[4]);
-
-    /* if (n % blksz != 0) { */
-    /*     printf("Please choose the dimensions of the system as a multiple of the block size\n"); */
-    /*     return EXIT_FAILURE; */
-    /* } */
-
-    /* if (blksz % 32 != 0) { */
-    /*     printf("Please choose the block size as a multiple of 32\n"); */
-    /*     return EXIT_FAILURE; */
-    /* } */
-
-    printf("Matrix size is set to %d, the block size is %d.\n", n, blksz);
-
-    // Set A to a symmetric positive definite matrix.
-    spd_matrix_type matrix_type = DENSE; // DENSE, BANDED, ARROWHEAD     
-    double *A = (double *) _mm_malloc(n*n*sizeof(double), ALIGNMENT);     
-    switch (matrix_type) {     
-    case DENSE:     
-    {
-        printf("Generate dense symmetric positive definite matrix A...\n");         
-        generate_dense_spd_matrix(n, A);     
-    }
-    break;
-
-    case BANDED:
-    {         
-        const int bandwidth = 2*blksz;         
-        printf("Generate banded symmetric positive definite matrix A with bandwidth = %d...\n", bandwidth);         
-        generate_banded_spd_matrix(n, bandwidth, A);     
-    }     
-    break;
-
-    case ARROWHEAD:     
-    {
-        // Compute the number of blocks.
-        const int num_blks = (n + blksz - 1) / blksz;
-
-        // The band and the arrowhead fill blocks completely.
-        const int num_blks_band = 1;
-        const int bandwidth = num_blks_band * blksz;
-
-        // The arrowhead fills the same number of blocks as the band.
-        const int arrowwidth = num_blks_band * blksz - (num_blks * blksz - n);
-
-        printf("Generate arrowhead symmetric positive definite matrix A with bandwidth = %d and arrowwidth = %d...\n", bandwidth, arrowwidth);
-        generate_arrowhead_spd_matrix(n, bandwidth, arrowwidth, A);
-    }     
-    break;
-    }
+    // Generate random SPD matrix A.
+    printf("Generating SPD matrix A...\n");
+    int ldA = n;
+    double *A = (double *) malloc(n * ldA * sizeof(double));     
+    generate_dense_spd_matrix(n, A, ldA);     
 
     // Copy A to Ain.
-    printf("Copy A to preserve a copy of the input matrix...\n");
-    double *Ain = (double *) _mm_malloc(n*n*sizeof(double), ALIGNMENT);
-    memcpy(Ain, A, n*n*sizeof(double));
-
-    // Allocate workspace.
-    printf("Allocate workspace...\n");
-    double *workspace = (double *) _mm_malloc(num_workers * blocksize * blocksize * sizeof(double), ALIGNMENT);
-    double *window = (double *) _mm_malloc(blksz * blksz * sizeof(double), ALIGNMENT);
+    printf("Copying A to Ain...\n");
+    double *Ain = (double *) malloc(n * ldA * sizeof(double));
+    memcpy(Ain, A, n * ldA * sizeof(double));
 
     // Start the runtime system.
-    pcp_start(num_workers);
-    if (num_critical_workers >= 0) {
+    pcp_start(num_threads);
+
+    // Set the execution mode.
+    if (reserved_set_size == 0) {
+        pcp_set_mode(PCP_REGULAR);
+    } else {
         pcp_set_mode(PCP_FIXED);
-        pcp_set_num_critical_workers(num_critical_workers);
-    }
-    if (num_critical_workers == -1) {
-        pcp_set_mode(PCP_ADAPTIVE);
-    }
-    if (num_critical_workers == -2) {
-        pcp_set_mode(PCP_PRESCRIBED);
+        pcp_set_reserved_set_size(reserved_set_size);
     }
 
     // Call the driver.
-    printf("Call the driver routine...\n");
-    parallel_block_chol(n, blksz, A, workspace, window);
+    printf("Calling the driver routine...\n");
+    parallel_block_chol(n, blksz, A, ldA);
 
     if (verify) {
         // Verify the solution.
-        printf("Solve using LAPACKE dpotrf...\n");
-        double tm_dpotrf = gettime();
-        LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'L', n, Ain, n);
-        tm_dpotrf = gettime() - tm_dpotrf;
-        printf("DPOTRF execution time = %.6lf\n", tm_dpotrf);
-        printf("Verify the computed solution...\n");
-        compare_lower_triangular_matrices(n, Ain, A);
+        printf("Verifying the solution... ");
+        fflush(stdout);
+        double tm = pcp_get_time();
+        LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'L', n, Ain, ldA);
+        tm = pcp_get_time() - tm;
+        double error = compare_lower_triangular_matrices(n, Ain, ldA, A, ldA);
+        if (error < 1e-14) {
+            printf("PASSED\n");
+        } else {
+            printf("FAILED\n");
+        }
+        printf("LAPACK_dpotrf took %.6lf seconds\n", tm);
+    } else {
+        printf("Verification disabled\n");
     }
 
     // Save the trace.
+    printf("Saving the trace...\n");
     pcp_view_trace_tikz();
 
     // View statistics.
+    printf("Printing statistics...\n");
     pcp_view_statistics_stdout();
 
     // Stop the runtime system.
     pcp_stop();
 
     // Clean up.
-    _mm_free(A);
-    _mm_free(Ain);
-    _mm_free(workspace);
-    _mm_free(window);
+    free(A);
+    free(Ain);
 
     return EXIT_SUCCESS;
 }
 
-
-static void compare_lower_triangular_matrices(
-    int n,
-    double *restrict const L1, double *restrict const L2)
-{
-#define L1(i,j) L1[(i) + (j) * n]
-#define L2(i,j) L2[(i) + (j) * n]
-
-    // Write zeros explicitly
-    #pragma omp simd aligned(L1:ALIGNMENT), aligned(L2:ALIGNMENT)
-    for (int i = 0; i < n; i++) {
-        for (int j = i+1; j < n; j++) {
-            L1(i,j) = 0.0;
-            L2(i,j) = 0.0;
-        }
-    }
-
-    // validate ||L1 - L2|| == 0
-    #pragma omp simd aligned(L1:ALIGNMENT), aligned(L2:ALIGNMENT)
-    for (int j = 0; j < n; j++) {
-        for (int i = 0; i < n; i++) {
-            L1(i,j) = L1(i,j) - L2(i,j);
-        }
-    }
-
-    printf("1-norm         = %.6le\n", LAPACKE_dlange(LAPACK_COL_MAJOR, '1', n, n, L1, n));
-    printf("Frobenius-norm = %.6le\n", LAPACKE_dlange(LAPACK_COL_MAJOR, 'F', n, n, L1, n));
-
-#undef L1
-#undef L2
-}

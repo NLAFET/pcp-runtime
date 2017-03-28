@@ -4,7 +4,6 @@
 #include "tasks.h"
 
 
-
 void syrk_task_par_reconfigure(int nth)
 {
     // empty
@@ -21,11 +20,11 @@ void syrk_task_par(void *ptr, int nth, int me)
 {
     struct syrk_task_arg *arg = (struct syrk_task_arg*) ptr;
 
-    int n = arg->n;
-    int k = arg->k;
+    int n       = arg->n;
+    int k       = arg->k;
     double *A21 = arg->A21;
     double *A22 = arg->A22;
-    int ldA = arg->ldA;
+    int ldA     = arg->ldA;
 
     // Balance the load by flops.
     int part[nth + 1];
@@ -43,10 +42,12 @@ void syrk_task_par(void *ptr, int nth, int me)
     }
 
     const int my_first_col = part[me];
-    const int my_num_cols = part[me + 1] - part[me];
+    const int my_num_cols  = part[me + 1] - part[me];
     const int i1 = my_first_col;
     const int i2 = i1 + my_num_cols;
     const int m2 = n - i2;
+
+    // TODO Insert picture (see krnl_syrk in task_chol_par).
 
     if (my_num_cols > 0) {
         cblas_dsyrk(CblasColMajor, CblasLower, CblasNoTrans,

@@ -62,7 +62,7 @@ int main(int argc, char *argv[])
         pcp_set_mode(PCP_REGULAR);
     } else {
         pcp_set_mode(PCP_FIXED);
-        pcp_set_num_critical_workers(reserved_set_size);
+        pcp_set_reserved_set_size(reserved_set_size);
     }
 
     // Allocate matrices.
@@ -135,9 +135,11 @@ int main(int argc, char *argv[])
     }
 
     // Save trace.
+    printf("Saving the trace...\n");
     pcp_view_trace_tikz();
 
     // Print statistics.
+    printf("Printing statistics...\n");
     pcp_view_statistics_stdout();
 
     // Stop the runtime system.

@@ -2,21 +2,39 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
-#include <string.h>
 #include <sys/time.h>
 #include <hwloc.h>
 
 #include "pcp.h"
 
 
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// INTERNAL DATA STRUCTURES
-////////////////////////////////////////////////////////////////////////////////
+// INTERNAL CONSTANTS
+//
 
 
 #define MAX_NUM_TASK_TYPES 64
 #define MAX_NUM_MESSAGES 4
 #define MAX_NUM_ADAPTIONS 1024
+
+
+
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// INTERNAL DATA STRUCTURES
+//
 
 
 /**
@@ -66,15 +84,28 @@ struct task
     /** The task has been executed. */
     bool is_executed;
 
+    /** The number of prescribed cores (if the mode is PCP_PRESCRIBED). */
     int prescribed_num_cores;
 
+    /** Timestamp for the start of task execution. */
     double time_start;
+
+    /** Timestamp for the end of task execution. */
     double time_end;
+
+    /** The rank of the first core assigned to the task. */
     int first_core;
+
+    /** The number of (consecutively ranked) cores assigned to the task. */
     int num_cores;
 
+    /** The execution time (time_end - time_start). */
     double time;
+
+    /** The longest path starting at this task. */
     double longest_path;
+
+    /** The second longest path starting at this task. */
     double second_longest_path;
 };
 
@@ -117,6 +148,9 @@ struct queue
 enum command_type { CMD_EXECUTE, CMD_SHRINK, CMD_GROW };
 
 
+/**
+ * Commands sent from master to all slaves in the reserved set.
+ */
 struct command
 {
     /** The type of command. */
@@ -136,14 +170,14 @@ struct command
         struct
         {
             /** The new smaller barrier. */
-            spin_barrier_t *barrier;
+            pcp_barrier_t *barrier;
         } shrink;
 
         /** The body of a command of type CMD_GROW. */
         struct
         {
             /** The new larger barrier. */
-            spin_barrier_t *barrier;
+            pcp_barrier_t *barrier;
         } grow;
     } body;
 };
@@ -152,6 +186,9 @@ struct command
 enum message_type { MSG_EXECUTE, MSG_RECRUIT, MSG_TERMINATE, MSG_WARMUP };
 
 
+/**
+ * Messages sent between threads.
+ */
 struct message
 {
     /** The type of message. */
@@ -171,24 +208,14 @@ struct message
         struct
         {
             /** The new larger barrier. */
-            spin_barrier_t *barrier;
+            pcp_barrier_t *barrier;
         } recruit;
-
-        /** The body of a message of type MSG_TERMINATE. */
-        struct
-        {
-        } terminate;
-
-        /** The body of a message of type MSG_WARMUP. */
-        struct
-        {
-        } warmup;
     } body;
 };
 
 
 /**
- * Single thread message queue. 
+ * Message queue for one thread.
  */
 struct mqueue
 {
@@ -227,16 +254,16 @@ struct worker
     bool is_idle;
 
     /** Execution time of critical tasks. */
-    double time_critical_tasks;
+    double time_critical;
 
     /** Time spent in critical tasks. */
-    double cost_critical_tasks;
+    double cost_critical;
 
     /** Time spent in non-critical tasks. */
-    double cost_noncritical_tasks;
+    double cost_noncritical;
 
-    /** Time spent being a critical worker. */
-    double time_critical_worker;
+    /** Time spent in the reserved set. */
+    double time_reserved;
 };
 
 
@@ -273,26 +300,25 @@ struct state
     pthread_cond_t cv_master;
 
     /** Barrier for synchronization of all threads at startup. */
-    spin_barrier_t *barrier;
+    pcp_barrier_t *barrier_global;
 
-    /** Low-latency barrier for synchronization between master and
-        critical workers. */
-    spin_barrier_t *critical_barrier;
+    /** Barrier for synchronization within the reserved set. */
+    pcp_barrier_t *barrier_reserved;
 
-    /** Command structure for master -> critical worker communication. */
+    /** Command structure for master -> slave communiction within the reserved set. */
     struct command command;
 
     /** The number of workers (including the master). */
     int num_workers;
 
-    /** The current number of critical workers (including the master). */
-    int num_critical_workers;
+    /** The current size of the reserved set. */
+    int reserved_set_size;
 
     /** Mode of execution. */
     int mode;
 
-    /** Fixed number of critical workers if mode == PCP_FIXED. */
-    int fixed_num_critical_workers;
+    /** If mode == PCP_FIXED, the specified size of the reserved set. */
+    int fixed_reserved_set_size;
 
     /** Flags if there is an ongoing recruitment. */
     bool is_recruiting;
@@ -317,17 +343,50 @@ struct state
 };
 
 
-/** File-scope variable representing the entire runtime system state. */
+
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// INTERNAL FILE-SCOPE VARIABLES
+// 
+
+
+
+/** The runtime system state. */
 static struct state state;
 
 
-/* Variables used to support thread affinity. */
+/** Hardware topology for thread affinity. */
 static hwloc_topology_t topology;
 
 
+/** The nominal clock frequency of a core. */
+static int nominal_clock_frequency = 0;
+
+
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// INTERNAL FUNCTIONS
-////////////////////////////////////////////////////////////////////////////////
+// UTILITY FUNCTION DEFINITIONS
+//
+
+
+static double gettime(void);
+static void lock(void);
+static void unlock(void);
+static void task_type_2_color(pcp_task_type_handle_t task_type, char *color);
 
 
 /**
@@ -407,14 +466,35 @@ static void task_type_2_color(pcp_task_type_handle_t task_type, char *color)
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Core frequency functions
+// FREQUENCY FUNCTION DEFINITIONS
 //
 
-static int nominal_clock_frequency = 0;
+
+static void freq_estimate_nominal(void);
+static int freq_get(int core);
+static void freq_warmup(int core);
 
 
-static void estimate_nominal_frequency(void)
+/**
+ * Estimates the nominal clock frequency.
+ *
+ * Sets the nominal_clock_frequency variable.
+ */
+static void freq_estimate_nominal(void)
 {
     FILE *fp;
     int freq = 0;
@@ -437,7 +517,14 @@ static void estimate_nominal_frequency(void)
 }
 
 
-static int get_frequency(int core)
+/**
+ * Reads the current (approximate) clock frequency of a core.
+ *
+ * @param [in] core The core of interest.
+ *
+ * @return The current frequency in KHz. 
+ */
+static int freq_get(int core)
 {
     static char *paths[] =
         {
@@ -520,79 +607,147 @@ static int get_frequency(int core)
 }
 
 
-static void warmup(int core)
+/**
+ * Warmup a specific core to the nominal clock frequency.
+ *
+ * @param [in] core The core on which the caller is running.
+ */
+static void freq_warmup(int core)
 {
     // Synchronize.
-    spin_barrier_wait(state.barrier);
+    pcp_barrier_wait(state.barrier_global);
 
     // Warm up.
-    while (get_frequency(core) < 0.99 * nominal_clock_frequency) {
+    while (freq_get(core) < 0.99 * nominal_clock_frequency) {
         // empty
     }
     
     // Synchronize.
-    spin_barrier_wait(state.barrier);
+    pcp_barrier_wait(state.barrier_global);
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Thread affinity functions
+// AFFINITY FUNCTION DEFINITIONS
 //
 
-static int get_num_cores(void)
+
+static int affinity_get_num_cores(void);
+static void affinity_init(void);
+static void affinity_finalize(void);
+static void affinity_bind(int core);
+
+
+/**
+ * Returns the number of cores in the system.
+ *
+ * @return The total number of cores.
+ */
+static int affinity_get_num_cores(void)
 {
     int cnt = hwloc_get_nbobjs_by_type(topology, HWLOC_OBJ_CORE);
     return cnt;
 }
 
 
-static void thread_affinity_init(void)
+/**
+ * Initializes the thread affinity module.
+ */
+static void affinity_init(void)
 {
     hwloc_topology_init(&topology);
     hwloc_topology_load(topology);
-    printf("[INFO] Found %d cores\n", get_num_cores());
+    printf("[INFO] Found %d cores\n", affinity_get_num_cores());
 }
 
 
-static void thread_affinity_finalize(void)
+/**
+ * Finalizes the thread affinity module.
+ */
+static void affinity_finalize(void)
 {
     hwloc_topology_destroy(topology);
 }
 
 
-static void bind_thread_to_core(int core)
+/**
+ * Bind the caller to a specified core.
+ *
+ * @param [in] core The core to bind the caller to.
+ */
+static void affinity_bind(int core)
 {
-    int num_cores = get_num_cores();
+    int num_cores = affinity_get_num_cores();
     hwloc_obj_t obj;
     obj = hwloc_get_obj_by_type(topology, HWLOC_OBJ_CORE, core);
     hwloc_set_cpubind(topology, obj->cpuset, HWLOC_CPUBIND_THREAD);
 }
 
 
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Adaption trace functions.
+// ADAPTION TRACE FUNCTION DEFINITIONS
 //
+
+
+static void adaption_trace_add_event(int size);
 
 
 /**
  * Add adaption event at this time.
  *
- * @param count The new critical worker count.
+ * @param size The new size of the reserved set.
  */
-static void add_adaption_event(int count)
+static void adaption_trace_add_event(int size)
 {
     if (state.num_adaption_events < MAX_NUM_ADAPTIONS) {
         int pos = state.num_adaption_events;
         state.num_adaption_events += 1;
         state.adaption_events[pos].time = gettime();
-        state.adaption_events[pos].count = count;
+        state.adaption_events[pos].size = size;
     }
 }
 
 
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Command functions.
+// COMMAND FUNCTION DEFINITIONS
 //
+
+
+static struct command cmd_wait(pcp_barrier_t *barrier);
+static void cmd_ack(pcp_barrier_t *barrier);
+static void cmd_bcast_execute(pcp_barrier_t *barrier, struct task *task);
+static void cmd_bcast_shrink(pcp_barrier_t *barrier, pcp_barrier_t *small_barrier);
+static void cmd_bcast_grow(pcp_barrier_t *barrier, pcp_barrier_t *large_barrier);
+static void cmd_bcast_wait(pcp_barrier_t *barrier);
 
 
 /**
@@ -602,10 +757,10 @@ static void add_adaption_event(int count)
  *
  * @return The received command.
  */
-static struct command cmd_wait(spin_barrier_t *barrier)
+static struct command cmd_wait(pcp_barrier_t *barrier)
 {
     // Wait for the command.
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
     
     // Return the received command.
     return state.command;
@@ -617,9 +772,9 @@ static struct command cmd_wait(spin_barrier_t *barrier)
  *
  * @param barrier The current barrier.
  */
-static void cmd_ack(spin_barrier_t *barrier)
+static void cmd_ack(pcp_barrier_t *barrier)
 {
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
 }
 
 
@@ -630,14 +785,14 @@ static void cmd_ack(spin_barrier_t *barrier)
  *
  * @param task The ready task to execute.
  */
-static void cmd_bcast_execute(spin_barrier_t *barrier, struct task *task)
+static void cmd_bcast_execute(pcp_barrier_t *barrier, struct task *task)
 {
     // Populate the command structure.
     state.command.type = CMD_EXECUTE;
     state.command.body.execute.task = task;
     
     // Signal the workers.
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
 }
 
 
@@ -648,14 +803,14 @@ static void cmd_bcast_execute(spin_barrier_t *barrier, struct task *task)
  *
  * @param small_barrier The new smaller barrier.
  */
-static void cmd_bcast_shrink(spin_barrier_t *barrier, spin_barrier_t *small_barrier)
+static void cmd_bcast_shrink(pcp_barrier_t *barrier, pcp_barrier_t *small_barrier)
 {
     // Populate the command structure.
     state.command.type = CMD_SHRINK;
     state.command.body.shrink.barrier = small_barrier;
     
     // Signal the workers.
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
 }
 
 
@@ -666,14 +821,14 @@ static void cmd_bcast_shrink(spin_barrier_t *barrier, spin_barrier_t *small_barr
  *
  * @param large_barrier The new larger barrier.
  */
-static void cmd_bcast_grow(spin_barrier_t *barrier, spin_barrier_t *large_barrier)
+static void cmd_bcast_grow(pcp_barrier_t *barrier, pcp_barrier_t *large_barrier)
 {
     // Populate the command structure.
     state.command.type = CMD_GROW;
     state.command.body.grow.barrier = large_barrier;
     
     // Signal the workers.
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
 }
 
 
@@ -682,14 +837,27 @@ static void cmd_bcast_grow(spin_barrier_t *barrier, spin_barrier_t *large_barrie
  *
  * @param barrier The barrier.
  */
-static void cmd_bcast_wait(spin_barrier_t *barrier)
+static void cmd_bcast_wait(pcp_barrier_t *barrier)
 {
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
 //////////////////////////////////////////////////////////////////////////////// 
-// Message queue functions.
+// MESSAGE QUEUE FUNCTION DEFINITIONS
 // 
 
 
@@ -699,8 +867,9 @@ static struct message mqueue_wait(int rank);
 static struct message *mqueue_allocate(int rank);
 static void mqueue_signal(int rank);
 static void mqueue_send_execute(int rank, struct task *task);
-static void mqueue_send_recruit(int rank, spin_barrier_t *barrier);
+static void mqueue_send_recruit(int rank, pcp_barrier_t *barrier);
 static void mqueue_send_terminate(int rank);
+static void mqueue_send_warmup(int rank);
 
 
 /**
@@ -836,7 +1005,7 @@ static void mqueue_send_execute(int rank, struct task *task)
  *
  * @note The runtime lock must be held.
  */
-static void mqueue_send_recruit(int rank, spin_barrier_t *barrier)
+static void mqueue_send_recruit(int rank, pcp_barrier_t *barrier)
 {
     // Allocate a message structure on the queue.
     struct message *msg = mqueue_allocate(rank);
@@ -890,9 +1059,25 @@ static void mqueue_send_warmup(int rank)
 }
 
 
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Functions for managing the shared queue of ready tasks.
+// QUEUE FUNCTION DEFINITIONS
 //
+
+
+static void queue_init(void);
+static void queue_destroy(void);
+static void queue_push(struct task *task);
+static struct task *queue_pop(void);
 
 
 /**
@@ -986,9 +1171,32 @@ static struct task *queue_pop(void)
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Task functions.
+// TASK FUNCTION DEFINITIONS
 // 
+
+
+static struct task *task_from_handle(pcp_task_handle_t handle);
+static struct task *task_create(pcp_task_type_handle_t type, void *arg);
+static void task_destroy(struct task *task);
+static void task_add_outgoing_edge(struct task *task, struct task *dest);
+static void task_add_incoming_edge(struct task *task, struct task *src);
+static void task_distribute_ready(void);
+static void task_post_process(struct task *task);
+static void task_execute_seq(struct task *task, int rank);
+static void task_execute_par(struct task *task, int rank);
 
 
 /**
@@ -998,7 +1206,7 @@ static struct task *queue_pop(void)
  *
  * @return The task pointer.
  */
-static struct task *handle2task(pcp_task_handle_t handle)
+static struct task *task_from_handle(pcp_task_handle_t handle)
 {
     return state.graph.tasks[(int) handle];
 }
@@ -1016,19 +1224,27 @@ static struct task *handle2task(pcp_task_handle_t handle)
 static struct task *task_create(pcp_task_type_handle_t type, void *arg)
 {
     struct task *task = (struct task*) malloc(sizeof(struct task));
-    task->type = type;          // Constant.
-    task->arg = arg;            // Constant.
-    task->seqnr = state.graph.num_tasks; // Constant.
-    task->num_in = 0;           // To be modified when building the graph.
-    task->num_out = 0;          // To be modified when building the graph.
-    task->out_capacity = 16;    // To be modified when building the graph.
-    task->priority = 0;         // To be modified after buildnig the graph.
-    task->critical_edge = -1;   // To be modified after building the graph.
-    task->is_critical = false;  // To be modified after building the graph.
-    task->is_executed = false;  // To be modified when executing the graph.
-    task->num_in_ready = 0;     // To be modified when executing the graph.
-    task->prescribed_num_cores = -1; // To be modified when executing the graph if mode == PCP_PRESCRIBED.
-    task->out = (struct task**) malloc(sizeof(struct task*) * task->out_capacity);
+    task->arg                  = arg;
+    task->type                 = type;
+    task->handle               = PCP_TASK_HANDLE_NULL;
+    task->priority             = 0;     
+    task->seqnr                = state.graph.num_tasks;
+    task->num_in               = 0;
+    task->num_in_ready         = 0;
+    task->num_out              = 0;      
+    task->out_capacity         = 16;
+    task->critical_edge        = -1;
+    task->is_critical          = false;
+    task->is_executed          = false;
+    task->prescribed_num_cores = -1; 
+    task->out                  = (struct task**) malloc(sizeof(struct task*) * task->out_capacity);
+    task->time_start           = 0;
+    task->time_end             = 0;
+    task->first_core           = -1;
+    task->num_cores            = 0;
+    task->time                 = 0;
+    task->longest_path         = 0;
+    task->second_longest_path  = 0;
     return task;
 }
 
@@ -1086,10 +1302,15 @@ static void task_add_incoming_edge(struct task *task, struct task *src)
 }
 
 
+/**
+ * Distribute ready tasks to idle workers.
+ */
 static void task_distribute_ready(void)
 {
     // Send tasks to all idle workers.
-    for (int rank = state.num_critical_workers; rank < state.num_workers && state.queue.num_tasks > 0; ++rank) {
+    for (int rank = state.reserved_set_size;
+         rank < state.num_workers && state.queue.num_tasks > 0;
+         ++rank) {
         if (state.workers[rank].is_idle) {
             struct task *ready = queue_pop();
             mqueue_send_execute(rank, ready);
@@ -1110,7 +1331,7 @@ static void task_post_process(struct task *task)
     state.graph.num_executed_tasks += 1;
     if (state.graph.num_executed_tasks == state.graph.num_tasks) {
         // Signal master that all tasks have been executed.
-        if (state.num_critical_workers == 0) {
+        if (state.reserved_set_size == 0) {
             mqueue_send_terminate(0);
         } else {
             pthread_cond_signal(&state.cv_master);
@@ -1128,7 +1349,7 @@ static void task_post_process(struct task *task)
         // Did the successor become ready as a result?
         if (succ->num_in_ready == succ->num_in) {
             // Is the task critical?
-            if (succ->is_critical && state.num_critical_workers > 0) {
+            if (succ->is_critical && state.reserved_set_size > 0) {
                 // Signal master that a critical task is ready.
                 pthread_cond_signal(&state.cv_master);
             } else {
@@ -1143,38 +1364,56 @@ static void task_post_process(struct task *task)
 }
 
 
+/**
+ * Execute a task sequentially.
+ *
+ * @param [inout] task The task.
+ *
+ * @param [in] rank The rank of the caller
+ */
 static void task_execute_seq(struct task *task, int rank)
 {
+    // Record start time.
     task->time_start = gettime();
     task->first_core = rank;
     task->num_cores = 1;
 
+    // Execute sequentially.
     struct pcp_task_type *type = state.task_types + task->type;
     type->sequential_impl(task->arg);
-
+    
+    // Record end time.
     task->time_end = gettime();
     task->time = task->time_end - task->time_start;
 }
 
 
+/**
+ * Execute a task in parallel.
+ *
+ * @param [inout] task The task.
+ *
+ * @param [in] rank The rank of the caller.
+ */
 static void task_execute_par(struct task *task, int rank)
 {
     if (rank == 0) {
         // Record start time.
         task->time_start = gettime();
         task->first_core = rank;
-        task->num_cores = state.num_critical_workers;
+        task->num_cores = state.reserved_set_size;
 
         // Broadcast an CMD_EXECUTE command.
-        cmd_bcast_execute(state.critical_barrier, task);
+        cmd_bcast_execute(state.barrier_reserved, task);
     }
 
+    // Execute in parallel.
     struct pcp_task_type *type = state.task_types + task->type;
-    type->parallel_impl(task->arg, state.num_critical_workers, rank);
+    type->parallel_impl(task->arg, state.reserved_set_size, rank);
 
     if (rank == 0) {
         // Wait for the task to complete.
-        cmd_bcast_wait(state.critical_barrier);
+        cmd_bcast_wait(state.barrier_reserved);
 
         // Record end time.
         task->time_end = gettime();
@@ -1183,20 +1422,48 @@ static void task_execute_par(struct task *task, int rank)
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Graph functions.
+// GRAPH FUNCTION DEFINITIONS
 //
 
 
+static void graph_init(void);
+static void graph_clear(void);
+static void graph_destroy(void);
+static void graph_identify_ready_tasks(bool include_critical);
+static double graph_identify_longest_path_aposteriori(void);
+static void graph_identify_critical_path(void);
+static float graph_compute_task_priorities_recursively(struct task *root);
+static void graph_compute_task_priorities(void);
+
+
+/**
+ * Allocates memory for the graph.
+ */
 static void graph_init(void)
 {
-    state.graph.tasks_capacity = 1024;
-    state.graph.tasks = (struct task**) malloc(sizeof(struct task*) * state.graph.tasks_capacity);
-    state.graph.num_tasks = 0;
+    state.graph.tasks_capacity     = 1024;
+    state.graph.tasks              = (struct task**) malloc(sizeof(struct task*) * state.graph.tasks_capacity);
+    state.graph.num_tasks          = 0;
     state.graph.num_executed_tasks = 0;
 }
 
 
+/**
+ * Resets/empties the graph.
+ */
 static void graph_clear(void)
 {
     for (int i = 0; i < state.graph.num_tasks; ++i) {
@@ -1207,6 +1474,9 @@ static void graph_clear(void)
 }
 
 
+/**
+ * Frees resources allocated to the graph.
+ */
 static void graph_destroy(void)
 {
     for (int i = 0; i < state.graph.num_tasks; ++i) {
@@ -1217,13 +1487,20 @@ static void graph_destroy(void)
 }
 
 
-static void graph_identify_ready_tasks(void)
+/**
+ * Identify the initially ready tasks in the graph
+ *
+ * Ready tasks are pushed to the shared queue.
+ *
+ * @param [in] include_critical If set, then also include ready critical tasks.
+ */
+static void graph_identify_ready_tasks(bool include_critical)
 {
     for (int i = 0; i < state.graph.num_tasks; ++i) {
         struct task *task = state.graph.tasks[i];
 
         // Skip critical tasks.
-        if (task->is_critical) {
+        if (!include_critical && task->is_critical) {
             continue;
         }
 
@@ -1235,6 +1512,11 @@ static void graph_identify_ready_tasks(void)
 }
 
 
+/**
+ * Find the longest path.
+ *
+ * @return The length of the longest path.
+ */
 static double graph_identify_longest_path_aposteriori(void)
 {
     const int n = state.graph.num_tasks;
@@ -1287,6 +1569,11 @@ static double graph_identify_longest_path_aposteriori(void)
 }                                                     
 
 
+/**
+ * Identify the critical path based on the number of tasks in the path.
+ *
+ * The found critical path is encoded in the task structures.
+ */
 static void graph_identify_critical_path(void)
 {
     // Find task with maximum task priority = head of critical path.
@@ -1319,6 +1606,13 @@ static void graph_identify_critical_path(void)
 }
 
 
+/**
+ * Recursively compute task priorities for the subgraph rooted at a given task.
+ *
+ * @param [inout] root The task at the root of the subgraph.
+ *
+ * @return The priority assigned to root.
+ */
 static float graph_compute_task_priorities_recursively(struct task *root)
 {
     if (root->priority == 0) {
@@ -1341,6 +1635,9 @@ static float graph_compute_task_priorities_recursively(struct task *root)
 }
 
 
+/**
+ * Compute priorities of all tasks.
+ */
 static void graph_compute_task_priorities(void)
 {
     for (int i = 0; i < state.graph.num_tasks; ++i) {
@@ -1352,11 +1649,37 @@ static void graph_compute_task_priorities(void)
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// Master functions.
+// MASTER FUNCTION DEFINITIONS
 //
 
 
+static void master_warmup(void);
+static void master_reconfigure(void);
+static pcp_barrier_t *master_grow_start(int size);
+static void master_grow_finish(pcp_barrier_t *next_barrier);
+static void master_try_grow_finish(pcp_barrier_t *next_barrier);
+static void master_shrink(int size);
+static void master_terminate(void);
+static void master_execute_graph_regular(void);
+static void master_execute_graph(void);
+
+
+/**
+ * Warm up all threads.
+ */
 static void master_warmup(void)
 {
     lock();
@@ -1364,21 +1687,21 @@ static void master_warmup(void)
         mqueue_send_warmup(i);
     }
     unlock();
-    warmup(0);
+    freq_warmup(0);
 }
 
 
 /**
  * Reconfigures all the task types (where applicable).
  *
- * Call this function after changing state.num_critical_workers.
+ * Call this function after changing state.reserved_set_size.
  */
-static void reconfigure_task_types(void)
+static void master_reconfigure(void)
 {
     for (int i = 0; i < state.num_task_types; ++i) {
         struct pcp_task_type *type = state.task_types + i;
         if (type->parallel_reconfigure) {
-            type->parallel_reconfigure(state.num_critical_workers);
+            type->parallel_reconfigure(state.reserved_set_size);
         }
     }
 }
@@ -1391,23 +1714,23 @@ static void reconfigure_task_types(void)
  *
  * @return The new larger barrier.
  */
-static spin_barrier_t *master_grow_start(int size)
+static pcp_barrier_t *master_grow_start(int size)
 {
-    spin_barrier_t *next_barrier;
+    pcp_barrier_t *next_barrier;
     
     // Add to trace.
-    add_adaption_event(size);
+    adaption_trace_add_event(size);
 
     // Store information about recruitment process.
     state.is_recruiting = true;
-    state.num_recruits = size - state.num_critical_workers;
+    state.num_recruits = size - state.reserved_set_size;
     state.num_arrived_recruits = 0;
             
     // Create new larger barrier.
-    next_barrier = spin_barrier_create(state.num_critical_workers + state.num_recruits);
+    next_barrier = pcp_barrier_create(state.reserved_set_size + state.num_recruits);
 
     // Send MSG_RECRUIT message to all recruits.
-    for (int i = state.num_critical_workers; i < state.num_critical_workers + state.num_recruits; ++i) {
+    for (int i = state.reserved_set_size; i < state.reserved_set_size + state.num_recruits; ++i) {
         mqueue_send_recruit(i, next_barrier);
     }
 
@@ -1420,28 +1743,28 @@ static spin_barrier_t *master_grow_start(int size)
  *
  * @param next_barrier The new larger barrier.
  */
-static void master_grow_finish(spin_barrier_t *next_barrier)
+static void master_grow_finish(pcp_barrier_t *next_barrier)
 {
     // Broadcast CMD_GROW command.
-    cmd_bcast_grow(state.critical_barrier, next_barrier);
+    cmd_bcast_grow(state.barrier_reserved, next_barrier);
 
     // Wait for acknowledgment.
-    cmd_bcast_wait(state.critical_barrier);
+    cmd_bcast_wait(state.barrier_reserved);
 
     // Safely destroy the old barrier.
-    spin_barrier_wait_and_destroy(state.critical_barrier);
+    pcp_barrier_wait_and_destroy(state.barrier_reserved);
 
     // Replace the barrier.
-    state.critical_barrier = next_barrier;
+    state.barrier_reserved = next_barrier;
 
     // Finish the recruitment process.
     state.is_recruiting = false;
-    state.num_critical_workers += state.num_recruits;
+    state.reserved_set_size += state.num_recruits;
     state.num_recruits = 0;
     state.num_arrived_recruits = 0;
 
     // Reconfigure the task types.
-    reconfigure_task_types();
+    master_reconfigure();
 }
 
 
@@ -1450,7 +1773,7 @@ static void master_grow_finish(spin_barrier_t *next_barrier)
  *
  * @param next_barrier The new larger barrier.
  */
-static void master_try_grow_finish(spin_barrier_t *next_barrier)
+static void master_try_grow_finish(pcp_barrier_t *next_barrier)
 {
     if (state.is_recruiting && state.num_arrived_recruits == state.num_recruits) {
         master_grow_finish(next_barrier);
@@ -1459,40 +1782,40 @@ static void master_try_grow_finish(spin_barrier_t *next_barrier)
 
 
 /**
- * Shrink the number of critical workers.
+ * Shrink the size of the reserved set.
  *
- * @param size The new number of critical workers.
+ * @param size The new size.
  */
 static void master_shrink(int size)
 {
     // Quick return if possible.
-    if (state.num_critical_workers == size) {
+    if (state.reserved_set_size == size) {
         return;
     }
 
     // Add adaption event.
-    add_adaption_event(size);
+    adaption_trace_add_event(size);
 
-    // Update the number of critical workers.
-    state.num_critical_workers = size;
+    // Update the reserved set size.
+    state.reserved_set_size = size;
 
     // Create a smaller barrier.
-    spin_barrier_t *small_barrier = spin_barrier_create(size);
+    pcp_barrier_t *small_barrier = pcp_barrier_create(size);
 
     // Broadcast the CMD_SHRINK command.
-    cmd_bcast_shrink(state.critical_barrier, small_barrier);
+    cmd_bcast_shrink(state.barrier_reserved, small_barrier);
 
     // Wait for workers to process command.
-    cmd_bcast_wait(state.critical_barrier);
+    cmd_bcast_wait(state.barrier_reserved);
 
     // Safely destroy the old barrier.
-    spin_barrier_wait_and_destroy(state.critical_barrier);
+    pcp_barrier_wait_and_destroy(state.barrier_reserved);
 
     // Replace the barrier with the smaller one.
-    state.critical_barrier = small_barrier;
+    state.barrier_reserved = small_barrier;
 
     // Reconfigure the task types.
-    reconfigure_task_types();
+    master_reconfigure();
 }
 
 
@@ -1509,24 +1832,23 @@ static void master_terminate(void)
 }
 
 
-static void master_execute_graph_like_slave(void)
+/**
+ * Master's algorithm to execute the graph in the PCP_REGULAR mode.
+ */
+static void master_execute_graph_regular(void)
 {
     struct worker *me = &state.workers[0];
     bool terminated = false;
 
     double execution_time = gettime();
-    
-    // Locate the ready critical task.
-    struct task *task = NULL;
-    for (int i = 0; i < state.graph.num_tasks; ++i) {
-        if (state.graph.tasks[i]->is_critical && state.graph.tasks[i]->num_in == 0) {
-            task = state.graph.tasks[i];
-            break;
-        }
-    }
 
-    // Distribute the ready task.
-    queue_push(task);
+    // Mark self as idle.
+    me->is_idle = true;
+    
+    // Identify ready tasks.
+    graph_identify_ready_tasks(true);
+
+    // Distribute ready tasks.
     task_distribute_ready();
 
     // Loop until terminated.
@@ -1544,9 +1866,9 @@ static void master_execute_graph_like_slave(void)
         switch (msg.type) {
         case MSG_EXECUTE:
         {
-            ////////////////////////////////////////////////////////////
+            //
             // Execute the task.
-            //////////////////////////////////////////////////////////// 
+            //
 
             // Get the task.
             struct task *task = msg.body.execute.task;
@@ -1555,11 +1877,11 @@ static void master_execute_graph_like_slave(void)
             task_execute_seq(task, me->rank);
 
             // Accumulate coset of exeucting tasks.
-            me->cost_noncritical_tasks += task->time_end - task->time_start;
+            me->cost_noncritical += task->time_end - task->time_start;
             
-            ////////////////////////////////////////////////////////////
+            //
             // Post-process the task.
-            //////////////////////////////////////////////////////////// 
+            //
 
             // Acquire the lock.
             lock();
@@ -1599,13 +1921,19 @@ static void master_execute_graph_like_slave(void)
  */
 static void master_execute_graph(void)
 {
-    if (state.num_critical_workers == 0) {
-        master_execute_graph_like_slave();
+    if (state.reserved_set_size == 0) {
+        master_execute_graph_regular();
         return;
     }
     
-    spin_barrier_t *next_barrier = NULL;
+    pcp_barrier_t *next_barrier = NULL;
     
+    // Identify ready tasks.
+    graph_identify_ready_tasks(false);
+
+    // Distribute ready tasks.
+    task_distribute_ready();
+
     // Locate the ready critical task.
     struct task *task = NULL;
     for (int i = 0; i < state.graph.num_tasks; ++i) {
@@ -1647,18 +1975,18 @@ static void master_execute_graph(void)
         // Acquire the lock.
         lock();
 
-        // Run control logic for mode PCP_PRESCRIBED.
+        // Run control logic for PCP_PRESCRIBED mode.
         if (state.mode == PCP_PRESCRIBED && state.is_recruiting == false) {
-            if (task->prescribed_num_cores > state.num_critical_workers) {
+            if (task->prescribed_num_cores > state.reserved_set_size) {
                 next_barrier = master_grow_start(task->prescribed_num_cores);
-            } else if (task->prescribed_num_cores < state.num_critical_workers) {
+            } else if (task->prescribed_num_cores < state.reserved_set_size) {
                 master_shrink(task->prescribed_num_cores);
             }
         }
 
-        ////////////////////////////////////////////////////////////
+        //
         // Wait for the task to become ready.
-        ////////////////////////////////////////////////////////////
+        //
 
         // Loop until ready.
         if (task->num_in_ready != task->num_in) {
@@ -1667,32 +1995,24 @@ static void master_execute_graph(void)
             }
         }
 
-        // Run control logic for mode PCP_PRESCRIBED.
+        // Run control logic for PCP_PRESCRIBED mode.
         if (state.mode == PCP_PRESCRIBED) {
-            master_try_grow_finish(next_barrier);
-        }
-
-        if (state.mode == PCP_ADAPTIVE) {
-            ////////////////////////////////////////////////////////////
-            // Finalize recruitment process, if any.
-            ////////////////////////////////////////////////////////////
-            
             master_try_grow_finish(next_barrier);
         }
             
         // Release the lock.
         unlock();
         
-        ////////////////////////////////////////////////////////////
+        //
         // Execute the task.
-        ////////////////////////////////////////////////////////////
+        //
 
         // Get the task implementations.
         struct pcp_task_type *task_type = state.task_types + (int) task->type;
 
         // Determine how to execute the task (sequentially or in parallel).
         bool sequentially = true;
-        if (task_type->parallel_impl == NULL || state.num_critical_workers == 1) {
+        if (task_type->parallel_impl == NULL || state.reserved_set_size == 1) {
             sequentially = true;
         } else {
             sequentially = false;
@@ -1706,12 +2026,12 @@ static void master_execute_graph(void)
             // Participate in the parallel execution of the task.
             task_execute_par(task, 0);
         }
-        state.workers[0].cost_critical_tasks += task->time * (sequentially ? 1 : state.num_critical_workers);
-        state.workers[0].time_critical_tasks += task->time;
+        state.workers[0].cost_critical += task->time * (sequentially ? 1 : state.reserved_set_size);
+        state.workers[0].time_critical += task->time;
 
-        ////////////////////////////////////////////////////////////
+        //
         // Post-process the task.
-        ////////////////////////////////////////////////////////////
+        //
 
         // Acquire the lock.
         lock();
@@ -1722,9 +2042,9 @@ static void master_execute_graph(void)
         // Release the lock.
         unlock();
 
-        ////////////////////////////////////////////////////////////
+        //
         // Advance to the next critical task.
-        ////////////////////////////////////////////////////////////
+        //
         
         // Advance to the next critical task.
         if (task->num_out > 0) {
@@ -1739,8 +2059,8 @@ static void master_execute_graph(void)
         master_grow_finish(next_barrier);
     }
 
-    // Release all critical workers.
-    if (state.num_critical_workers > 1) { 
+    // Get rid of all slaves from the reserved set.
+    if (state.reserved_set_size > 1) { 
         master_shrink(1);
     }
 
@@ -1754,7 +2074,7 @@ static void master_execute_graph(void)
     // Compute and save total execution time.
     execution_time = gettime() - execution_time;
     state.execution_time = execution_time;
-    state.workers[0].time_critical_worker += execution_time;
+    state.workers[0].time_reserved += execution_time;
     
     // Print out actual and prescribed thread counts.
     if (state.mode == PCP_PRESCRIBED) {
@@ -1776,14 +2096,29 @@ static void master_execute_graph(void)
 }
 
 
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////////////
+// WORKER FUNCTION DEFINITIONS
+// 
+
+
+static void worker_reserved(struct worker *me, pcp_barrier_t *barrier);
+static void *worker_other(void *ptr);
+
+
 /**
- * Implements the critical worker algorithm.
+ * Worker's algorithm when in the reserved set.
  *
  * @param me The worker state.
  *
- * @param barrier The barrier for master/worker synchronization.
+ * @param barrier The barrier for synchronization.
  */
-static void critical_worker(struct worker *me, spin_barrier_t *barrier)
+static void worker_reserved(struct worker *me, pcp_barrier_t *barrier)
 {
     double tm = gettime();
     
@@ -1812,10 +2147,10 @@ static void critical_worker(struct worker *me, spin_barrier_t *barrier)
             cmd_ack(barrier);
 
             // Safely destroy the old barrier.
-            spin_barrier_wait_and_destroy(barrier);
+            pcp_barrier_wait_and_destroy(barrier);
 
             // Am I one of the critical workers?
-            if (me->rank < state.num_critical_workers) {
+            if (me->rank < state.reserved_set_size) {
                 // Yes.
 
                 // Use the new smaller barrier.
@@ -1825,7 +2160,7 @@ static void critical_worker(struct worker *me, spin_barrier_t *barrier)
 
                 // Account for time as critical worker.
                 tm = gettime() - tm;
-                me->time_critical_worker += tm;
+                me->time_reserved += tm;
 
                 // Return back to the non-critical worker algorithm.
                 return;
@@ -1839,7 +2174,7 @@ static void critical_worker(struct worker *me, spin_barrier_t *barrier)
             cmd_ack(barrier);
 
             // Safely destroy the old barrier.
-            spin_barrier_wait_and_destroy(barrier);
+            pcp_barrier_wait_and_destroy(barrier);
             
             // Use the new larger barrier.
             barrier = cmd.body.grow.barrier;
@@ -1851,16 +2186,16 @@ static void critical_worker(struct worker *me, spin_barrier_t *barrier)
 
 
 /**
- * Implements the non-critical worker algorithm.
+ * Worker's algorithm when not in the reserved set.
  *
  * @param ptr The worker state of type struct worker. 
  */
-static void *worker_thread(void *ptr)
+static void *worker_other(void *ptr)
 {
     struct worker *me = (struct worker*) ptr;
 
     // Set thread affinity.
-    bind_thread_to_core(me->rank);
+    affinity_bind(me->rank);
 
     bool terminated = false;
 
@@ -1879,9 +2214,9 @@ static void *worker_thread(void *ptr)
         switch (msg.type) {
         case MSG_EXECUTE:
         {
-            ////////////////////////////////////////////////////////////
+            //
             // Execute the task.
-            //////////////////////////////////////////////////////////// 
+            //
 
             // Get the task.
             struct task *task = msg.body.execute.task;
@@ -1890,11 +2225,11 @@ static void *worker_thread(void *ptr)
             task_execute_seq(task, me->rank);
 
             // Accumulate coset of exeucting tasks.
-            me->cost_noncritical_tasks += task->time_end - task->time_start;
+            me->cost_noncritical += task->time_end - task->time_start;
             
-            ////////////////////////////////////////////////////////////
+            //
             // Post-process the task.
-            //////////////////////////////////////////////////////////// 
+            //
 
             // Acquire the lock.
             lock();
@@ -1919,8 +2254,8 @@ static void *worker_thread(void *ptr)
             state.num_arrived_recruits += 1;
             unlock();
 
-            // Run the critical worker algorithm and then continue.
-            critical_worker(me, msg.body.recruit.barrier);
+            // Run the algorithm for the reserved set and then continue.
+            worker_reserved(me, msg.body.recruit.barrier);
 
             // Check if there is a task for me.
             lock();
@@ -1937,7 +2272,7 @@ static void *worker_thread(void *ptr)
             break;
 
         case MSG_WARMUP:
-            warmup(me->rank);
+            freq_warmup(me->rank);
             break;
         }
     }
@@ -1946,9 +2281,20 @@ static void *worker_thread(void *ptr)
 }
 
 
+
+
+
+
+
+
+
+
+
+
+
 ////////////////////////////////////////////////////////////////////////////////
-// API FUNCTIONS
-////////////////////////////////////////////////////////////////////////////////
+// API FUNCTION DEFINITIONS
+//
 
 
 double pcp_get_time(void)
@@ -1962,13 +2308,13 @@ void pcp_start(int num_workers)
     printf("[INFO] Starting\n");
     
     // Estimate nominal core frequency.
-    estimate_nominal_frequency();
+    freq_estimate_nominal();
 
     // Initialize thread affinity.
-    thread_affinity_init();
+    affinity_init();
 
     // Get the number of cores.
-    int num_cores = get_num_cores();
+    int num_cores = affinity_get_num_cores();
 
     // Use all cores if no count specified.
     if (num_workers == 0) {
@@ -1976,15 +2322,15 @@ void pcp_start(int num_workers)
     }
 
     // Initialize misc members.
-    state.num_workers = num_workers;
-    state.num_critical_workers = 1;
-    state.mode = PCP_FIXED;
-    state.fixed_num_critical_workers = 1;
-    state.is_recruiting = false;
-    state.num_recruits = 0;
-    state.num_arrived_recruits = 0;
-    state.num_task_types = 0;
-    state.num_adaption_events = 0;
+    state.num_workers             = num_workers;
+    state.reserved_set_size       = 1;
+    state.mode                    = PCP_FIXED;
+    state.fixed_reserved_set_size = 1;
+    state.is_recruiting           = false;
+    state.num_recruits            = 0;
+    state.num_arrived_recruits    = 0;
+    state.num_task_types          = 0;
+    state.num_adaption_events     = 0;
 
     // Initialize state.graph.
     graph_init();
@@ -1996,8 +2342,8 @@ void pcp_start(int num_workers)
     pthread_mutex_init(&state.lock, NULL);
 
     // Initialize barriers.
-    state.barrier = spin_barrier_create(state.num_workers);
-    state.critical_barrier = spin_barrier_create(state.num_critical_workers);
+    state.barrier_global   = pcp_barrier_create(state.num_workers);
+    state.barrier_reserved = pcp_barrier_create(state.reserved_set_size);
 
     // Initialize state.workers.
     state.workers = malloc(sizeof(struct worker) * num_workers);
@@ -2006,12 +2352,12 @@ void pcp_start(int num_workers)
         state.workers[i].is_idle = true;
         mqueue_init(i);
         if (i != 0) {
-            pthread_create(&state.workers[i].thread, NULL, worker_thread, &state.workers[i]);
+            pthread_create(&state.workers[i].thread, NULL, worker_other, &state.workers[i]);
         }
     }
 
     // Set thread affinity.
-    bind_thread_to_core(0);
+    affinity_bind(0);
 
     printf("[INFO] Started\n");
 }
@@ -2024,21 +2370,20 @@ void pcp_set_mode(int mode)
     switch (mode) {
     case PCP_REGULAR:
     {
-        state.fixed_num_critical_workers = 0;
+        state.fixed_reserved_set_size = 0;
         printf("[INFO] Using the regular mode\n");
     }
     break;
     
     case PCP_FIXED:
     {
-        state.fixed_num_critical_workers = 1;
+        state.fixed_reserved_set_size = 1;
         printf("[INFO] Using the fixed mode\n");
     }
     break;
     
     case PCP_ADAPTIVE:
     {
-        state.num_critical_workers = 1;
         printf("[INFO] Using the adaptive mode\n");
     }
     break;
@@ -2052,18 +2397,18 @@ void pcp_set_mode(int mode)
 }
 
 
-void pcp_set_num_critical_workers(int num_critical_workers)
+void pcp_set_reserved_set_size(int size)
 {
     // Update thread count.
-    state.fixed_num_critical_workers = num_critical_workers;
-    printf("[INFO] Reserving %d core(s) in the fixed mode\n", num_critical_workers);
+    state.fixed_reserved_set_size = size;
+    printf("[INFO] Reserving %d core(s) in the fixed mode\n", size);
 }
 
 
 void pcp_stop(void)
 {
-    // Shrink the critical worker set size to 1 (i.e., only master).
-    if (state.num_critical_workers > 1) {
+    // Shrink the reserved set to 1 (i.e., only master).
+    if (state.reserved_set_size > 1) {
         master_shrink(1);
     }
 
@@ -2087,8 +2432,8 @@ void pcp_stop(void)
     pthread_mutex_destroy(&state.lock);
 
     // Clean up barriers.
-    spin_barrier_destroy(state.barrier);
-    spin_barrier_destroy(state.critical_barrier);
+    pcp_barrier_destroy(state.barrier_global);
+    pcp_barrier_destroy(state.barrier_reserved);
 
     // Finalize task types.
     for (int i = 0; i < state.num_task_types; ++i) {
@@ -2099,7 +2444,7 @@ void pcp_stop(void)
     }
 
     // Finalize thread affinity.
-    thread_affinity_finalize();
+    affinity_finalize();
 
     printf("[INFO] Stopped\n");
 }
@@ -2118,7 +2463,7 @@ pcp_task_type_handle_t pcp_register_task_type(struct pcp_task_type *type)
 
     // Call the reconfigure callback.
     if (type->parallel_reconfigure) {
-        type->parallel_reconfigure(state.num_critical_workers);
+        type->parallel_reconfigure(state.reserved_set_size);
     }
 
     // Return the task type handle.
@@ -2177,8 +2522,8 @@ void pcp_insert_dependence(pcp_task_handle_t source, pcp_task_handle_t sink)
 
     // Translate handles to tasks.
     struct task
-        *from = handle2task(source),
-        *to   = handle2task(sink);
+        *from = task_from_handle(source),
+        *to   = task_from_handle(sink);
 
     // Add outgoing edge from source.
     task_add_outgoing_edge(from, to);
@@ -2195,46 +2540,29 @@ void pcp_execute_graph(void)
 
     // Reset worker statistics.
     for (int i = 0; i < state.num_workers; ++i) {
-        state.workers[i].time_critical_worker = 0;
-        state.workers[i].time_critical_tasks = 0;
-        state.workers[i].cost_critical_tasks = 0;
-        state.workers[i].cost_noncritical_tasks = 0;
+        state.workers[i].time_reserved    = 0;
+        state.workers[i].time_critical    = 0;
+        state.workers[i].cost_critical    = 0;
+        state.workers[i].cost_noncritical = 0;
     }
 
     // Reset misc state variables.
     state.num_adaption_events = 0;
 
-    // Adjust the number of critical workers if mode is PCP_FIXED.
-    if (state.mode == PCP_FIXED) {
-        if (state.fixed_num_critical_workers > state.num_critical_workers) {
-            // Recruit more critical workers.
-            if (state.fixed_num_critical_workers > state.num_critical_workers) {
-                spin_barrier_t *next_barrier;
-                next_barrier = master_grow_start(state.fixed_num_critical_workers);
+    // Adjust the size of the reserved set if mode is PCP_FIXED or PCP_REGULAR.
+    if (state.mode == PCP_FIXED || state.mode == PCP_REGULAR) {
+        if (state.fixed_reserved_set_size > state.reserved_set_size) {
+            // Recruit more workers into the reserved set.
+            if (state.fixed_reserved_set_size > state.reserved_set_size) {
+                pcp_barrier_t *next_barrier;
+                next_barrier = master_grow_start(state.fixed_reserved_set_size);
                 master_grow_finish(next_barrier);
             }
-        } else if (state.fixed_num_critical_workers < state.num_critical_workers) {
-            // Release some critical workers.
-            master_shrink(state.fixed_num_critical_workers);
+        } else if (state.fixed_reserved_set_size < state.reserved_set_size) {
+            // Release some workers from the reserved set.
+            master_shrink(state.fixed_reserved_set_size);
         }
     }
-
-    // Identify ready tasks.
-    graph_identify_ready_tasks();
-
-    // Acquire the lock.
-    lock();
-
-    // Send ready tasks to idle workers.
-    for (int rank = state.num_critical_workers; rank < state.num_workers && state.queue.num_tasks > 0; ++rank) {
-        if (state.workers[rank].is_idle) {
-            struct task *ready = queue_pop();
-            mqueue_send_execute(rank, ready);
-        }
-    }
-
-    // Release the lock.
-    unlock();
 
     // Execute the task graph.
     master_execute_graph();
@@ -2246,41 +2574,32 @@ void pcp_view_statistics(struct pcp_statistics *stats)
     // execution_time
     stats->execution_time = state.execution_time;
 
-    // busy_time
-    stats->busy_time = 0.0;
-    struct pcp_trace trace;
-    pcp_view_trace(&trace);
-    for (int i = 0; i < trace.num_events; ++i) {
-        struct pcp_event *ev = &trace.events[i];
-        stats->busy_time += (ev->end - ev->begin) * (double)(ev->num_cores);
-    }
-
     // cost
     stats->cost = state.num_workers * stats->execution_time;
 
-    // critical_worker_cost
-    stats->critical_worker_cost = 0;
+    // cost_reserved
+    stats->cost_reserved = 0;
     for (int i = 0; i < state.num_workers; ++i) {
-        stats->critical_worker_cost += state.workers[i].time_critical_worker;
+        stats->cost_reserved += state.workers[i].time_reserved;
     }
 
-    // noncritical_worker_cost
-    stats->noncritical_worker_cost = stats->cost - stats->critical_worker_cost;
+    // cost_other
+    stats->cost_other = stats->cost - stats->cost_reserved;
+
+    // cost_critical
+    stats->cost_critical = state.workers[0].cost_critical;
+
+    // cost_noncritical
+    stats->cost_noncritical = 0;
+    for (int i = 0; i < state.num_workers; ++i) {
+        stats->cost_noncritical += state.workers[i].cost_noncritical;
+    }
 
     // critical_path_length
-    stats->critical_path_length = state.workers[0].time_critical_tasks;
+    stats->critical_path_length = state.workers[0].time_critical;
 
     // longest_path_length
     stats->longest_path_length = graph_identify_longest_path_aposteriori();
-
-    // critical_task_cost
-    stats->critical_task_cost = state.workers[0].cost_critical_tasks;
-
-    // noncritical_task_cost
-    stats->noncritical_task_cost = 0;
-    for (int i = 0; i < state.num_workers; ++i) {
-        stats->noncritical_task_cost += state.workers[i].cost_noncritical_tasks;
-    }
 }
 
 
@@ -2292,16 +2611,16 @@ void pcp_view_statistics_stdout(void)
     printf("STATISTICS\n");
     printf("==================================================\n");
     printf("Execution time        = %.6lf\n", stats.execution_time);
-    printf("Resource utilization  = %.6lf\n", stats.busy_time / (stats.execution_time * state.num_workers));
+    printf("Resource utilization  = %.6lf\n", (stats.cost_critical + stats.cost_noncritical) / (stats.execution_time * state.num_workers));
     printf("Critical path length  = %.6lf (%5.1lf%%)\n", stats.critical_path_length, stats.critical_path_length / stats.execution_time * 100);
     printf("Longest path length   = %.6lf (%5.1lf%%)\n", stats.longest_path_length, stats.longest_path_length / stats.execution_time * 100);
     printf("Cost                  = %.6lf\n", stats.cost);
-    printf("..reserved set        = %.6lf (%5.1lf%%)\n", stats.critical_worker_cost, stats.critical_worker_cost / stats.cost * 100);
-    printf("....busy              = %.6lf (%5.1lf%%)\n", stats.critical_task_cost, stats.critical_task_cost / stats.critical_worker_cost * 100);
-    printf("..other               = %.6lf (%5.1lf%%)\n", stats.noncritical_worker_cost, stats.noncritical_worker_cost / stats.cost * 100);
-    printf("....busy              = %.6lf (%5.1lf%%)\n", stats.noncritical_task_cost, stats.noncritical_task_cost / stats.noncritical_worker_cost * 100);
-    printf("Task cost             = %.6lf (%5.1lf%%)\n", stats.noncritical_task_cost + stats.critical_task_cost, (stats.noncritical_task_cost + stats.critical_task_cost) / stats.cost * 100);
-    printf("Task cost per core    = %.6lf (%5.1lf%%)\n", (stats.noncritical_task_cost + stats.critical_task_cost) / state.num_workers, (stats.noncritical_task_cost + stats.critical_task_cost) / state.num_workers / stats.execution_time * 100);
+    printf("..reserved            = %.6lf (%5.1lf%%)\n", stats.cost_reserved, stats.cost_reserved / stats.cost * 100);
+    printf("....busy              = %.6lf (%5.1lf%%)\n", stats.cost_critical, stats.cost_critical / stats.cost_reserved * 100);
+    printf("..other               = %.6lf (%5.1lf%%)\n", stats.cost_other, stats.cost_other / stats.cost * 100);
+    printf("....busy              = %.6lf (%5.1lf%%)\n", stats.cost_noncritical, stats.cost_noncritical / stats.cost_other * 100);
+    printf("Task cost             = %.6lf (%5.1lf%%)\n", stats.cost_noncritical + stats.cost_critical, (stats.cost_noncritical + stats.cost_critical) / stats.cost * 100);
+    printf("Task cost per core    = %.6lf (%5.1lf%%)\n", (stats.cost_noncritical + stats.cost_critical) / state.num_workers, (stats.cost_noncritical + stats.cost_critical) / state.num_workers / stats.execution_time * 100);
     printf("==================================================\n");
 }
 
@@ -2379,32 +2698,32 @@ void pcp_view_trace_tikz(void)
     fprintf(fp, "\\begin{document}\n");
     fprintf(fp, "\\begin{tikzpicture}[y=-1cm]\n");
 
-    // Outline critical workers.
+    // Outline the reservet set.
     {
         // \draw (0,0) -- (0,1) [-- (x,y1) -- (x,y2)] -- (e,y) -- (e,0) -- cycle;
-        int count = 1;
+        int size = 1;
         fprintf(fp, "\\draw [dashed, fill=green!50] (0,0) -- (0,1)");
         for (int i = 0; i < trace.num_adaption_events; ++i) {
             double when = scale * trace.adaption_events[i].time;
-            int new_count = trace.adaption_events[i].count;
-            fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,%d)", when, count, when, new_count);
-            count = new_count;
+            int new_size = trace.adaption_events[i].size;
+            fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,%d)", when, size, when, new_size);
+            size = new_size;
         }
-        fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,0) -- cycle;\n", width, count, width);
+        fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,0) -- cycle;\n", width, size, width);
     }
 
-    // Outline non-critical workers.
+    // Outline the non-reserved set.
     {
         // \draw (0,p) -- (0,1) -- [-- (x,y1) -- (x,y2)] -- (e,y) -- (e,p) -- cycle;
-        int count = 1;
+        int size = 1;
         fprintf(fp, "\\draw [dashed, fill=blue!50] (0,%d) -- (0,1)", state.num_workers);
         for (int i = 0; i < trace.num_adaption_events; ++i) {
             double when = scale * trace.adaption_events[i].time;
-            int new_count = trace.adaption_events[i].count;
-            fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,%d)", when, count, when, new_count);
-            count = new_count;
+            int new_size = trace.adaption_events[i].size;
+            fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,%d)", when, size, when, new_size);
+            size = new_size;
         }
-        fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,%d) -- cycle;\n", width, count, width, state.num_workers);
+        fprintf(fp, " -- (%.2lf,%d) -- (%.2lf,%d) -- cycle;\n", width, size, width, state.num_workers);
     }
     
     // Print task events.

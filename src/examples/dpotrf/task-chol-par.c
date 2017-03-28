@@ -1,18 +1,16 @@
 #include <stdlib.h>
-#include <stdio.h>
-#include <sys/time.h>
 #include <cblas.h>
 #include <lapacke.h>
-#include <x86intrin.h>
 
 #include "../../runtime/pcp.h"
 #include "tasks.h"
+#include "utils.h"
 
 
 #define BLOCK_SIZE 32
-#define MAXTHREADS 16
-#define MAXITER 64
 #define MAX_MATRIX_SIZE 1024
+#define MAX_NUM_ITER (MAX_MATRIX_SIZE / BLOCK_SIZE)
+#define MAX_NUM_THREADS 16
 
 
 // The matrix partitioning for TRSM and SYRK in each iteration.
@@ -36,17 +34,17 @@ struct partition
     int num_iter;
 
     // The partitionings for TRSM. 
-    int trsm[MAXITER][MAXTHREADS + 1];
+    int trsm[MAX_NUM_ITER][MAX_NUM_THREADS + 1];
 
     // The partitionings for SYRK.
-    int syrk[MAXITER][MAXTHREADS + 1];
+    int syrk[MAX_NUM_ITER][MAX_NUM_THREADS + 1];
 };
 
 
 // Barrier used to synchronize the workers between iterations.
-static spin_barrier_t *barrier = NULL;
+static pcp_barrier_t *barrier = NULL;
 
-static struct partition *partition_db[MAX_MATRIX_SIZE + 1][MAXTHREADS + 1] = {NULL};
+static struct partition *partition_db[MAX_MATRIX_SIZE + 1][MAX_NUM_THREADS + 1] = {NULL};
 static struct partition *partition = NULL;
 
 static double *A;
@@ -54,19 +52,6 @@ static int ldA;
 static int n;
 #define A(i,j) A[(i) + (j) * ldA]
 
-
-// Maximum of two integers.
-static int max(int a, int b)
-{
-    return a > b ? a : b;
-}
-
-
-// Ceiling of a / b, where a and b are positive.
-static int iceil(int a, int b)
-{
-    return (a + b - 1) / b;
-}
 
 
 // Initializes the partitioning for TRSM for a given iteration.
@@ -170,20 +155,20 @@ static void part_init(int matrix_size, int block_size, int num_threads)
 }
 
 
-void naive_chol_task_par_reconfigure(int nth)
+void chol_task_par_reconfigure(int nth)
 {
     // Choose current size of the worker pool for barrier.
     if (barrier != NULL) {
-        spin_barrier_destroy(barrier);
+        pcp_barrier_destroy(barrier);
     }
-    barrier = spin_barrier_create(nth);
+    barrier = pcp_barrier_create(nth);
 }
 
 
-void naive_chol_task_par_finalize(void)
+void chol_task_par_finalize(void)
 {
     if (barrier != NULL) {
-        spin_barrier_destroy(barrier);
+        pcp_barrier_destroy(barrier);
         barrier = NULL;
     }
 }
@@ -191,8 +176,8 @@ void naive_chol_task_par_finalize(void)
 
 static void krnl_chol(int iter)
 {
-    const int jp = iter * partition->block_size;
-    const int n = min(partition->matrix_size - jp, partition->block_size);
+    int jp      = iter * partition->block_size;
+    int n       = min(partition->matrix_size - jp, partition->block_size);
     double *A11 = &A(jp,jp);
 
     LAPACKE_dpotrf(LAPACK_COL_MAJOR, 'L', n, A11, ldA);    
@@ -210,13 +195,13 @@ static void krnl_syrk(int iter, int me)
     // g = gemm
     // s = syrk
 
-    const int jp = iter * partition->block_size;
-    const int i = part_block_start_syrk(iter, me);
-    const int m = part_block_size_syrk(iter, me);
-    const int j1 = jp + partition->block_size;
-    const int j2 = i;
-    const int n1 = j2 - j1;
-    const int k = partition->block_size;
+    int jp = iter * partition->block_size;
+    int i  = part_block_start_syrk(iter, me);
+    int m  = part_block_size_syrk(iter, me);
+    int j1 = jp + partition->block_size;
+    int j2 = i;
+    int n1 = j2 - j1;
+    int k  = partition->block_size;
 
     double *A21;
     double *A21a, *A21b;
@@ -234,7 +219,7 @@ static void krnl_syrk(int iter, int me)
 
     /* GEMM */
     if (m > 0 && n1 > 0) {
-        A22 = &A(i,j1);
+        A22  = &A(i,j1);
         A21a = &A(i,jp);
         A21b = &A(j1,jp);
         cblas_dgemm(CblasColMajor, CblasNoTrans, CblasTrans,
@@ -248,10 +233,10 @@ static void krnl_syrk(int iter, int me)
 
 static void krnl_trsm(int iter, int me)
 {
-    const int jp = iter * partition->block_size;
-    const int i = part_block_start_trsm(iter, me);
-    const int m = part_block_size_trsm(iter, me);
-    const int n = min(partition->matrix_size - jp, partition->block_size);
+    int jp      = iter * partition->block_size;
+    int i       = part_block_start_trsm(iter, me);
+    int m       = part_block_size_trsm(iter, me);
+    int n       = min(partition->matrix_size - jp, partition->block_size);
     double *A11 = &A(jp,jp);
     double *A21 = &A(i,jp);
 
@@ -264,13 +249,13 @@ static void krnl_trsm(int iter, int me)
 }
 
 
-void naive_chol_task_par(void *ptr, int nth, int me)
+void chol_task_par(void *ptr, int nth, int me)
 {
     struct chol_task_arg *arg = (struct chol_task_arg*) ptr;
        
-    A = arg->A;
+    n   = arg->n;
+    A   = arg->A;
     ldA = arg->ldA;
-    n = arg->n;
 
     if (me == 0) {
         part_init(n, BLOCK_SIZE, nth);
@@ -282,14 +267,14 @@ void naive_chol_task_par(void *ptr, int nth, int me)
     }
 
     // Synchronize.
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
 
     // Loop over iterations.
     for (int iter = 0; iter < partition->num_iter; ++iter) {
         const int final_iteration = (iter == partition->num_iter - 1);
 
         // Synchronize
-        spin_barrier_wait(barrier);
+        pcp_barrier_wait(barrier);
 
         //
         // Phase I: trsm(iter) in //
@@ -298,7 +283,7 @@ void naive_chol_task_par(void *ptr, int nth, int me)
         krnl_trsm(iter, me);
 
         // Synchronize
-        spin_barrier_wait(barrier);
+        pcp_barrier_wait(barrier);
 
         //
         // Phase II: syrk(iter) in // plus chol(iter + 1)
@@ -311,5 +296,5 @@ void naive_chol_task_par(void *ptr, int nth, int me)
     }
 
     // Synchronize
-    spin_barrier_wait(barrier);
+    pcp_barrier_wait(barrier);
 }

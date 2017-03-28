@@ -1,13 +1,11 @@
-#ifndef UTIL_SPIN_BARRIER_H
-#define UTIL_SPIN_BARRIER_H
+#ifndef RUNTIME_SPIN_BARRIER_H
+#define RUNTIME_SPIN_BARRIER_H
 
-// TODO Add pcp_ prefix.
+typedef struct pcp_barrier pcp_barrier_t;
 
-typedef struct spin_barrier spin_barrier_t;
-
-spin_barrier_t *spin_barrier_create(int nth);
-void spin_barrier_destroy(spin_barrier_t *bar);
-void spin_barrier_wait(spin_barrier_t *bar);
-void spin_barrier_wait_and_destroy(spin_barrier_t *bar);
+pcp_barrier_t *pcp_barrier_create(int nth);
+void pcp_barrier_destroy(pcp_barrier_t *bar);
+void pcp_barrier_wait(pcp_barrier_t *bar);
+void pcp_barrier_wait_and_destroy(pcp_barrier_t *bar);
 
 #endif
