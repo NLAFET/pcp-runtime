@@ -1,16 +1,37 @@
 INSTRUCTIONS FOR COMPILING AND LINKING THE RUNTIME SYSTEM AND EXAMPLES
+======================================================================
 
-CMake (https://cmake.org/) is used for the build process. Follow these
-basic instructions to build the library and examples.
+CMake (https://cmake.org/) is used for the build process. You will
+need to first install libhwloc, BLAS (with the cblas interface), and
+LAPACK.
 
-1. Create a directory called "build".
-2. Change to the "build" directory.
-3. Run "ccmake ../src".
-4. Type "c" for configure.
-5. Configure as appropriate.
-6. Type "c" again to reconfigure.
-7. Type "g" to generate and exit.
-8. Run "make" to build. 
+
+
+Follow these instructions to build the library and examples.
+
+1. Create a directory called "build"
+
+2. Change to the "build" directory
+
+3. Run
+
+   ccmake ../src
+
+4. Type "c" for configure
+
+5. Configure as appropriate
+
+6. Type "c" again to reconfigure
+
+7. Type "g" to generate and exit
+
+8. Run
+
+   make
+   
+   to build
+
+
 
 Assuming that there were no errors, you will now have two executables:
 + build/examples/dtrsm/test-dtrsm.x
@@ -18,8 +39,10 @@ Assuming that there were no errors, you will now have two executables:
 
 The runtime library is located at build/runtime/libpcp.a.
 
-For feedback and support, contact the Umeå University team manager Bo
-Kågström (bokg@cs.umu.se).
+
+
+If you need support, please contact the NLAFET coordinator Bo Kågström
+(bokg@cs.umu.se).
 
 
 

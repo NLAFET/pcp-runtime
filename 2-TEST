@@ -1,8 +1,100 @@
-INSTRUCTIONS FOR VALIDATING CORRECTNESS
+INSTRUCTIONS FOR VERIFYING CORRECTNESS
+======================================
 
-TODO
+There are scripts in the test/dtrsm/ and test/dpotrf/ directories that
+verifies the correctness on numerous randomly chosen inputs.
+
+The following instructions assumes that you have followed the
+instructions in 1-COMPILE and therefore have a build/ directory at the
+top level of the repository tree.
 
 
-INSTRUCTIONS FOR EVALUATING PERFORMANCE
 
-TODO
+To test the dtrsm example, follow these steps:
+
+1. Run
+
+   cd build/examples/dtrsm/
+
+2. Run
+
+   ../../../test/dtrsm/dtrsm-correctness.py
+
+3. Verify that there are no reported failures
+
+
+
+To test the dpotrf example, follow these steps:
+
+1. Run
+
+   cd build/examples/dpotrf/
+
+2. Run
+
+   ../../../test/dpotrf/dpotrf-correctness.py
+
+3. Verify that there are no reported failures
+
+
+
+Please contact the NLAFET coordinator Bo Kågström (bokg@cs.umu.se) if
+you encounter any failures.
+
+
+
+
+INSTRUCTIONS FOR TESTING PERFORMANCE
+====================================
+
+There are scripts in the test/dtrsm/ and test/dpotrf/ directories that
+carry out extensive performance tests.
+
+The following instructions assumes that you have followed the
+instructions in 1-COMPILE and therefore have a build/ directory at the
+top level of the repository tree.
+
+
+
+To test the performance of the dtrsm example, follow these steps:
+
+1. Run
+
+   cd build/examples/dtrsm/
+
+2. Run
+
+   cp ../../../data/dtrsm/config-performance.json config.json
+
+3. Follow the instructions in the
+   "../../../test/dtrsm/dtrsm-performance.py" script to adapt the
+   configuration file "config.json" to your machine.
+
+4. Run
+
+   ../../../test/dtrsm/dtrsm-performance.py config.json
+
+
+
+To test the performance of the dpotrf example, follow these steps:
+
+1. Run
+
+   cd build/examples/dpotrf/
+
+2. Run
+
+   cp ../../../data/dpotrf/config-performance.json config.json
+
+3. Follow the instructions in the
+   "../../../test/dpotrf/dpotrf-performance.py" script to adapt the
+   configuration file "config.json" to your machine.
+
+4. Run
+
+   ../../../test/dpotrf/dpotrf-performance.py config.json
+
+
+
+We encourage you to share specifications of your machine and the
+output files with the NLAFET coordinator Bo Kågström (bokg@cs.umu.se).
